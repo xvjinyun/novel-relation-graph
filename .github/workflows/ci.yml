@@ -1,0 +1,153 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# 说明：本流水线为「自适应」设计。
+# 第 1 阶段仓库尚无 backend/ 与 frontend/ 代码时，只执行仓库治理检查并绿灯；
+# 一旦代码骨架入库，后端与前端 job 会自动启用 Lint / 测试 / 构建等实质检查，无需更换文件。
+
+jobs:
+  repo-governance:
+    name: 仓库治理检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 校验必需治理文件齐备
+        run: |
+          set -e
+          files="README.md LICENSE CONTRIBUTING.md CHANGELOG.md .gitignore .env.example
+                 docs/architecture.md docs/er-diagram.md
+                 .github/workflows/ci.yml .github/pull_request_template.md
+                 .github/ISSUE_TEMPLATE/feature.md .github/ISSUE_TEMPLATE/bug.md"
+          for f in $files; do
+            if [ ! -s "$f" ]; then
+              echo "::error::缺少或为空: $f"
+              exit 1
+            fi
+          done
+          echo "✓ 治理文件齐备"
+
+      - name: 校验 README 内容
+        run: |
+          grep -q "小说人物关系图谱生成器" README.md || {
+            echo "::error::README 缺少项目名"; exit 1;
+          }
+          grep -q "github.com/xvjinyun/novel-relation-graph" README.md || {
+            echo "::error::README 缺少仓库地址"; exit 1;
+          }
+          echo "✓ README 校验通过"
+
+      - name: 校验工作流与模板 YAML 语法
+        run: |
+          python -m pip install --quiet pyyaml
+          python - <<'PY'
+          import glob, yaml
+          files = glob.glob(".github/**/*.yml", recursive=True) + glob.glob(".github/**/*.yaml", recursive=True)
+          assert files, "未找到任何 .github 下的 YAML 文件"
+          for f in files:
+              with open(f, encoding="utf-8") as fh:
+                  yaml.safe_load(fh)
+              print("YAML OK:", f)
+          PY
+
+      - name: 密钥与敏感文件检查
+        run: |
+          if git ls-files | grep -Eq '(^|/)\.env$'; then
+            echo "::error::.env 不得入库"; exit 1
+          fi
+          if grep -rInE 'LTAI[0-9A-Za-z]{12}|AKID[0-9A-Za-z]{20,}|sk-[A-Za-z0-9]{24,}' \
+              --exclude-dir=.git --exclude='*.md' . ; then
+            echo "::error::发现疑似真实密钥，请立即移除"; exit 1
+          fi
+          echo "✓ 未发现密钥泄漏"
+
+      - name: Issue / PR 模板规范检查
+        run: |
+          set -e
+          grep -q "验收标准" .github/ISSUE_TEMPLATE/feature.md
+          grep -q "Closes #" .github/pull_request_template.md
+          echo "✓ 模板规范检查通过"
+
+  backend:
+    name: 后端测试与构建
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 检测后端骨架
+        id: probe
+        run: |
+          if [ -f backend/requirements.txt ] && [ -d backend/app ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 安装依赖 / Lint / 测试
+        if: steps.probe.outputs.ready == 'true'
+        run: |
+          set -e
+          cd backend
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet -r requirements.txt
+          python -m pip install --quiet ruff pytest pytest-cov
+          ruff check app
+          if [ -d tests ] && [ -n "$(find tests -name 'test_*.py' -print -quit)" ]; then
+            pytest --cov=app --cov-report=term --cov-report=xml
+            python - <<'PY'
+          import xml.etree.ElementTree as ET
+          rate = float(ET.parse("coverage.xml").getroot().get("line-rate")) * 100
+          print(f"line coverage: {rate:.1f}%")
+          assert rate >= 40, f"覆盖率 {rate:.1f}% 低于要求的 40%"
+          PY
+          else
+            echo "尚无测试文件，本轮仅执行 Lint；测试建立后自动启用覆盖率门禁"
+          fi
+
+      - name: 骨架未建立（本轮跳过）
+        if: steps.probe.outputs.ready != 'true'
+        run: echo "后端代码尚未入库，本阶段跳过；骨架建立后自动启用实质检查"
+
+  frontend:
+    name: 前端检查与构建
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 检测前端骨架
+        id: probe
+        run: |
+          if [ -f frontend/package.json ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            if [ -f frontend/package-lock.json ]; then
+              echo "npm=ci" >> "$GITHUB_OUTPUT"
+            else
+              echo "npm=install" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 安装依赖 / Lint / 构建
+        if: steps.probe.outputs.ready == 'true'
+        working-directory: frontend
+        run: |
+          set -e
+          if [ "${{ steps.probe.outputs.npm }}" = "ci" ]; then npm ci; else npm install; fi
+          npm run lint --if-present
+          npm run build --if-present
+
+      - name: 骨架未建立（本轮跳过）
+        if: steps.probe.outputs.ready != 'true'
+        run: echo "前端代码尚未入库，本阶段跳过；骨架建立后自动启用实质检查"
